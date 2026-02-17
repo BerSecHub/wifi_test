@@ -72,6 +72,7 @@ DIM='\033[2m'
 # ---------------------------------------------------------------------------
 
 WIFI_IFACE=""
+WIFI_IFACE_BASE=""
 MON_IFACE=""
 RESULTS_DIR=""
 LOG_FILE=""
@@ -371,16 +372,32 @@ select_interface() {
 
     local ifaces=()
     local iface_info=()
+    local iface_modes=()
 
     while IFS= read -r line; do
         local iface
         iface=$(echo "$line" | awk '{print $2}')
         if [[ -n "$iface" ]]; then
-            local driver phy
+            local driver phy mode iface_type
             driver=$(ethtool -i "$iface" 2>/dev/null | grep "driver:" | awk '{print $2}' || echo "?")
             phy=$(iw dev "$iface" info 2>/dev/null | grep "wiphy" | awk '{print $2}' || echo "?")
+            mode=$(iw dev "$iface" info 2>/dev/null | grep "type" | awk '{print $2}' || echo "?")
+            iface_type="wbudowana"
+            # Detect USB (external) cards
+            if [[ -e "/sys/class/net/${iface}/device" ]]; then
+                local devpath
+                devpath=$(readlink -f "/sys/class/net/${iface}/device" 2>/dev/null || true)
+                if [[ "$devpath" == *"usb"* ]]; then
+                    iface_type="USB/zewnetrzna"
+                fi
+            fi
             ifaces+=("$iface")
-            iface_info+=("${iface} (driver: ${driver}, phy: ${phy})")
+            iface_modes+=("$mode")
+            if [[ "$mode" == "monitor" ]]; then
+                iface_info+=("${iface}  [${GREEN}MONITOR MODE${NC}]  (${iface_type}, driver: ${driver}, phy${phy})")
+            else
+                iface_info+=("${iface}  [managed]  (${iface_type}, driver: ${driver}, phy${phy})")
+            fi
         fi
     done < <(iw dev 2>/dev/null | grep "Interface")
 
@@ -391,24 +408,85 @@ select_interface() {
         exit 1
     fi
 
-    if [[ ${#ifaces[@]} -eq 1 ]]; then
+    # Show all detected interfaces
+    echo ""
+    log INFO "Znalezione interfejsy:"
+    for i in "${!ifaces[@]}"; do
+        echo -e "  ${iface_info[$i]}"
+    done
+    echo ""
+
+    # Check if any interface is already in monitor mode
+    local mon_found=""
+    local mon_idx=""
+    for i in "${!ifaces[@]}"; do
+        if [[ "${iface_modes[$i]}" == "monitor" ]]; then
+            mon_found="${ifaces[$i]}"
+            mon_idx="$i"
+        fi
+    done
+
+    if [[ -n "$mon_found" ]]; then
+        log OK "Wykryto interfejs już w trybie monitor: ${mon_found}"
+        if confirm "Użyć ${mon_found} (już w monitor mode)?"; then
+            WIFI_IFACE="$mon_found"
+            MON_IFACE="$mon_found"
+            MONITOR_ACTIVE=1
+            # Derive base name (strip 'mon' suffix) for later stop_monitor
+            WIFI_IFACE_BASE="${mon_found%mon}"
+            if [[ "$WIFI_IFACE_BASE" == "$mon_found" ]]; then
+                WIFI_IFACE_BASE="$mon_found"
+            fi
+            log OK "Używam: ${MON_IFACE} (monitor mode aktywny)"
+            return 0
+        fi
+    fi
+
+    # Filter out monitor-mode interfaces for managed selection
+    local managed_ifaces=()
+    local managed_info=()
+    for i in "${!ifaces[@]}"; do
+        if [[ "${iface_modes[$i]}" != "monitor" ]]; then
+            managed_ifaces+=("${ifaces[$i]}")
+            managed_info+=("${iface_info[$i]}")
+        fi
+    done
+
+    if [[ ${#managed_ifaces[@]} -eq 0 ]]; then
+        # All interfaces are in monitor mode, use the first one
+        log WARN "Wszystkie interfejsy są w trybie monitor."
         WIFI_IFACE="${ifaces[0]}"
-        log OK "Znaleziono interfejs: ${WIFI_IFACE}"
+        MON_IFACE="${ifaces[0]}"
+        MONITOR_ACTIVE=1
+        WIFI_IFACE_BASE="${WIFI_IFACE%mon}"
+        log OK "Używam: ${MON_IFACE}"
+        return 0
+    fi
+
+    if [[ ${#managed_ifaces[@]} -eq 1 ]]; then
+        WIFI_IFACE="${managed_ifaces[0]}"
+        log OK "Wybrany interfejs: ${WIFI_IFACE}"
     else
+        echo -e "${YELLOW}Wskazówka: wybierz kartę zewnętrzną (USB) do pentestów,${NC}"
+        echo -e "${YELLOW}           a wbudowaną zostaw w spokoju.${NC}"
         local idx
-        idx=$(select_from_list "Znaleziono ${#ifaces[@]} interfejsy WiFi:" "${iface_info[@]}")
-        WIFI_IFACE="${ifaces[$idx]}"
+        idx=$(select_from_list "Wybierz interfejs do pentestów:" "${managed_info[@]}")
+        WIFI_IFACE="${managed_ifaces[$idx]}"
         log OK "Wybrany interfejs: ${WIFI_IFACE}"
     fi
 
     # Check monitor mode support
     log INFO "Sprawdzanie obsługi trybu monitor..."
-    if iw phy "$(iw dev "$WIFI_IFACE" info 2>/dev/null | grep wiphy | awk '{print "phy"$2}')" info 2>/dev/null | grep -q "monitor"; then
+    local phy_name
+    phy_name=$(iw dev "$WIFI_IFACE" info 2>/dev/null | grep wiphy | awk '{print "phy"$2}')
+    if [[ -n "$phy_name" ]] && iw phy "$phy_name" info 2>/dev/null | grep -q "monitor"; then
         log OK "Interfejs ${WIFI_IFACE} obsługuje tryb monitor."
     else
         log WARN "Nie mogę potwierdzić obsługi trybu monitor dla ${WIFI_IFACE}."
         log WARN "Spróbuję kontynuować - może się udać mimo to."
     fi
+
+    WIFI_IFACE_BASE="$WIFI_IFACE"
 }
 
 setup_results_dir() {
@@ -431,6 +509,16 @@ start_monitor() {
         return 0
     fi
 
+    # Check if interface is already in monitor mode (user set it up before running script)
+    local current_mode
+    current_mode=$(iw dev "$WIFI_IFACE" info 2>/dev/null | grep "type" | awk '{print $2}' || true)
+    if [[ "$current_mode" == "monitor" ]]; then
+        MON_IFACE="$WIFI_IFACE"
+        MONITOR_ACTIVE=1
+        log OK "Interfejs ${WIFI_IFACE} jest już w trybie monitor."
+        return 0
+    fi
+
     log INFO "Włączanie trybu monitor na ${WIFI_IFACE}..."
 
     # Kill interfering processes
@@ -439,35 +527,83 @@ start_monitor() {
 
     # Start monitor mode
     if airmon-ng start "$WIFI_IFACE" &>/dev/null; then
-        # Detect new interface name
-        MON_IFACE="${WIFI_IFACE}mon"
-        if ! ip link show "$MON_IFACE" &>/dev/null; then
-            MON_IFACE="$WIFI_IFACE"
-        fi
-        if ! ip link show "$MON_IFACE" &>/dev/null; then
-            # Try to find it
-            MON_IFACE=$(iw dev 2>/dev/null | grep "Interface" | awk '{print $2}' | grep -E "mon|wlan" | head -1 || true)
+        # Detect new interface name - try common patterns
+        local candidates=(
+            "${WIFI_IFACE}mon"
+            "$WIFI_IFACE"
+        )
+        MON_IFACE=""
+
+        for candidate in "${candidates[@]}"; do
+            if ip link show "$candidate" &>/dev/null; then
+                local cmode
+                cmode=$(iw dev "$candidate" info 2>/dev/null | grep "type" | awk '{print $2}' || true)
+                if [[ "$cmode" == "monitor" ]]; then
+                    MON_IFACE="$candidate"
+                    break
+                fi
+            fi
+        done
+
+        # Fallback: scan all interfaces for monitor mode
+        if [[ -z "$MON_IFACE" ]]; then
+            while IFS= read -r line; do
+                local found_iface
+                found_iface=$(echo "$line" | awk '{print $2}')
+                local fmode
+                fmode=$(iw dev "$found_iface" info 2>/dev/null | grep "type" | awk '{print $2}' || true)
+                if [[ "$fmode" == "monitor" ]]; then
+                    MON_IFACE="$found_iface"
+                    break
+                fi
+            done < <(iw dev 2>/dev/null | grep "Interface")
         fi
 
-        if [[ -n "$MON_IFACE" ]] && ip link show "$MON_IFACE" &>/dev/null; then
+        if [[ -n "$MON_IFACE" ]]; then
             MONITOR_ACTIVE=1
             log OK "Monitor mode aktywny: ${MON_IFACE}"
         else
             log ERROR "Nie mogę znaleźć interfejsu monitor mode!"
+            log WARN "Spróbuj ręcznie: airmon-ng start ${WIFI_IFACE}"
+            log WARN "A potem uruchom skrypt ponownie - wykryje go automatycznie."
             return 1
         fi
     else
-        log ERROR "Nie udało się włączyć monitor mode!"
-        log WARN "Spróbuj ręcznie: airmon-ng start ${WIFI_IFACE}"
-        return 1
+        # airmon-ng failed, try manual method
+        log WARN "airmon-ng nie zadziałał, próbuję ręcznie..."
+        ip link set "$WIFI_IFACE" down 2>/dev/null || true
+        if iw dev "$WIFI_IFACE" set type monitor 2>/dev/null; then
+            ip link set "$WIFI_IFACE" up 2>/dev/null || true
+            MON_IFACE="$WIFI_IFACE"
+            MONITOR_ACTIVE=1
+            log OK "Monitor mode (ręcznie) aktywny: ${MON_IFACE}"
+        else
+            log ERROR "Nie udało się włączyć monitor mode!"
+            log WARN "Spróbuj ręcznie:"
+            log WARN "  sudo airmon-ng check kill"
+            log WARN "  sudo airmon-ng start ${WIFI_IFACE}"
+            log WARN "A potem uruchom skrypt ponownie."
+            return 1
+        fi
     fi
 }
 
 stop_monitor() {
     if [[ $MONITOR_ACTIVE -eq 1 && -n "$MON_IFACE" ]]; then
-        log INFO "Wyłączanie trybu monitor..."
+        log INFO "Wyłączanie trybu monitor na ${MON_IFACE}..."
+        # Try airmon-ng first
         airmon-ng stop "$MON_IFACE" &>/dev/null || true
+        # Fallback: manual method
+        if ip link show "$MON_IFACE" &>/dev/null; then
+            ip link set "$MON_IFACE" down 2>/dev/null || true
+            iw dev "$MON_IFACE" set type managed 2>/dev/null || true
+            ip link set "$MON_IFACE" up 2>/dev/null || true
+        fi
         MONITOR_ACTIVE=0
+        # Restore WIFI_IFACE to base name if we derived it
+        if [[ -n "${WIFI_IFACE_BASE:-}" ]]; then
+            WIFI_IFACE="$WIFI_IFACE_BASE"
+        fi
         systemctl start NetworkManager 2>/dev/null || true
         sleep 2
         log OK "Monitor mode wyłączony. NetworkManager uruchomiony."
@@ -1738,11 +1874,13 @@ show_menu() {
     clear
     banner
 
-    echo -e "${BOLD}Interfejs: ${CYAN}${WIFI_IFACE}${NC}"
     if [[ $MONITOR_ACTIVE -eq 1 ]]; then
-        echo -e "${BOLD}Monitor:   ${GREEN}${MON_IFACE} (aktywny)${NC}"
+        echo -e "${BOLD}Interfejs: ${CYAN}${MON_IFACE}${NC} ${GREEN}[MONITOR]${NC}"
+        if [[ -n "${WIFI_IFACE_BASE:-}" && "$WIFI_IFACE_BASE" != "$MON_IFACE" ]]; then
+            echo -e "${BOLD}           ${DIM}(base: ${WIFI_IFACE_BASE})${NC}"
+        fi
     else
-        echo -e "${BOLD}Monitor:   ${GRAY}nieaktywny${NC}"
+        echo -e "${BOLD}Interfejs: ${CYAN}${WIFI_IFACE}${NC} ${GRAY}[managed]${NC}"
     fi
     echo -e "${BOLD}Wyniki:    ${DIM}${RESULTS_DIR}${NC}"
     echo -e "${BOLD}Docelowe:  ${CYAN}${TARGET_SSIDS[*]}${NC}"
